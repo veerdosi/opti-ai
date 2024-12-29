@@ -2,11 +2,12 @@ import yfinance as yf
 import pandas as pd
 import sqlite3
 from datetime import datetime, timedelta
-from typing import List, Dict, Optional, Union
+from typing import List, Dict, Optional, Union, Tuple
 from dataclasses import dataclass
 import numpy as np
 from pathlib import Path
 import logging
+import json
 
 @dataclass
 class MarketDataConfig:
@@ -74,24 +75,46 @@ class MarketDataManager:
                     PRIMARY KEY (symbol, date, strike, expiry, option_type)
                 )
             """)
+
+            # Create strategy data table
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS strategy_data (
+                    strategy TEXT,
+                    date DATE,
+                    symbol TEXT,
+                    position_type TEXT,
+                    quantity INTEGER,
+                    entry_price REAL,
+                    current_price REAL,
+                    pnl REAL,
+                    delta REAL,
+                    gamma REAL,
+                    theta REAL,
+                    vega REAL,
+                    PRIMARY KEY (strategy, symbol, date)
+                )
+            """)
+            
+            # Create strategy metrics table
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS strategy_metrics (
+                    strategy TEXT PRIMARY KEY,
+                    metrics TEXT,
+                    last_updated TIMESTAMP
+                )
+            """)
             
             conn.commit()
     
     def fetch_historical_data(self, config: MarketDataConfig) -> Dict[str, pd.DataFrame]:
         """
         Fetch historical market data for specified symbols
-        
-        Args:
-            config: MarketDataConfig object with fetch parameters
-            
-        Returns:
-            Dictionary mapping symbols to their respective DataFrames
         """
         data_dict = {}
         
         for symbol in config.symbols:
             try:
-                # Check if we have data in database
+                # Check cache first
                 cached_data = self._get_cached_data(
                     symbol, 
                     config.start_date, 
@@ -127,18 +150,62 @@ class MarketDataManager:
                 raise
                 
         return data_dict
-    
+
+    # Strategy Data Management Methods
+    def save_strategy_data(self, strategy_name: str, data: pd.DataFrame):
+        """Save strategy data to database"""
+        with sqlite3.connect(self.db_path) as conn:
+            # Add strategy name column if not exists
+            if 'strategy' not in data.columns:
+                data['strategy'] = strategy_name
+            
+            # Convert datetime to string for SQLite
+            if 'date' in data.columns and isinstance(data['date'].iloc[0], datetime):
+                data['date'] = data['date'].dt.strftime('%Y-%m-%d')
+            
+            data.to_sql('strategy_data', conn, if_exists='append', index=False)
+
+    def get_strategy_data(self, strategy_name: Optional[str] = None) -> pd.DataFrame:
+        """Retrieve strategy data from database"""
+        query = "SELECT * FROM strategy_data"
+        if strategy_name:
+            query += f" WHERE strategy = '{strategy_name}'"
+            
+        with sqlite3.connect(self.db_path) as conn:
+            data = pd.read_sql_query(query, conn)
+            
+            # Convert date strings back to datetime
+            if 'date' in data.columns:
+                data['date'] = pd.to_datetime(data['date'])
+                
+        return data
+
+    def update_strategy_metrics(self, strategy_name: str, metrics: Dict):
+        """Update strategy metrics in database"""
+        with sqlite3.connect(self.db_path) as conn:
+            metrics_json = json.dumps(metrics)
+            
+            conn.execute("""
+                INSERT OR REPLACE INTO strategy_metrics (strategy, metrics, last_updated)
+                VALUES (?, ?, datetime('now'))
+            """, (strategy_name, metrics_json))
+            
+            conn.commit()
+
+    def get_strategy_metrics(self, strategy_name: str) -> Optional[Dict]:
+        """Get strategy metrics from database"""
+        with sqlite3.connect(self.db_path) as conn:
+            result = conn.execute(
+                "SELECT metrics FROM strategy_metrics WHERE strategy = ?",
+                (strategy_name,)
+            ).fetchone()
+            
+            if result:
+                return json.loads(result[0])
+        return None
+
     def _validate_market_data(self, data: pd.DataFrame, symbol: str):
-        """
-        Validate market data for common issues
-        
-        Args:
-            data: DataFrame containing market data
-            symbol: Symbol being validated
-        
-        Raises:
-            DataValidationError: If validation fails
-        """
+        """Validate market data for common issues"""
         if data.empty:
             raise DataValidationError(f"No data received for {symbol}")
             
@@ -156,7 +223,6 @@ class MarketDataManager:
         # Check for price anomalies
         price_cols = ['Open', 'High', 'Low', 'Close']
         for col in price_cols:
-            # Detect extreme price changes
             pct_change = data[col].pct_change().abs()
             anomalies = pct_change > 0.5  # 50% price change threshold
             if anomalies.any():
@@ -165,42 +231,24 @@ class MarketDataManager:
                 )
                 
     def _clean_market_data(self, data: pd.DataFrame) -> pd.DataFrame:
-        """
-        Clean and process market data
-        
-        Args:
-            data: Raw market data DataFrame
-            
-        Returns:
-            Cleaned DataFrame
-        """
-        # Create copy to avoid modifying original
+        """Clean and process market data"""
         cleaned = data.copy()
-        
-        # Forward fill missing values
-        cleaned = cleaned.ffill()
+        cleaned = cleaned.ffill()  # Forward fill missing values
         
         # Calculate additional metrics
         cleaned['returns'] = cleaned['Close'].pct_change()
         cleaned['volatility'] = cleaned['returns'].rolling(window=20).std() * np.sqrt(252)
-        
-        # Add technical indicators
         cleaned['SMA_20'] = cleaned['Close'].rolling(window=20).mean()
         cleaned['SMA_50'] = cleaned['Close'].rolling(window=50).mean()
         
-        # Drop any remaining NaN values
-        cleaned = cleaned.dropna()
-        
+        cleaned = cleaned.dropna()  # Drop any remaining NaN values
         return cleaned
     
     def _store_market_data(self, symbol: str, data: pd.DataFrame):
         """Store market data in SQLite database"""
         with sqlite3.connect(self.db_path) as conn:
-            # Prepare data for storage
             to_store = data.reset_index()
             to_store['symbol'] = symbol
-            
-            # Store in database
             to_store.to_sql('market_data', conn, if_exists='append', index=False)
             
     def _get_cached_data(
@@ -229,102 +277,3 @@ class MarketDataManager:
                 return df
                 
         return None
-    
-    def get_options_chain(
-        self, 
-        symbol: str, 
-        expiry_range: Optional[Tuple[datetime, datetime]] = None
-    ) -> pd.DataFrame:
-        """
-        Fetch current options chain for a symbol
-        
-        Args:
-            symbol: Stock symbol
-            expiry_range: Optional tuple of (start_date, end_date) for expiries
-            
-        Returns:
-            DataFrame containing options chain data
-        """
-        ticker = yf.Ticker(symbol)
-        
-        # Get list of expiries
-        expiries = ticker.options
-        
-        if expiry_range:
-            start_date, end_date = expiry_range
-            expiries = [
-                exp for exp in expiries 
-                if start_date <= datetime.strptime(exp, '%Y-%m-%d') <= end_date
-            ]
-        
-        chains = []
-        for expiry in expiries:
-            try:
-                # Fetch both calls and puts
-                opt = ticker.option_chain(expiry)
-                
-                # Combine calls and puts
-                calls = opt.calls
-                calls['option_type'] = 'call'
-                puts = opt.puts
-                puts['option_type'] = 'put'
-                
-                chain = pd.concat([calls, puts])
-                chain['expiry'] = expiry
-                chains.append(chain)
-                
-            except Exception as e:
-                self.logger.error(f"Error fetching options for {expiry}: {str(e)}")
-                continue
-                
-        if not chains:
-            raise DataValidationError(f"No valid options data found for {symbol}")
-            
-        # Combine all chains
-        options_data = pd.concat(chains, ignore_index=True)
-        
-        # Store in database
-        self._store_options_data(symbol, options_data)
-        
-        return options_data
-    
-    def _store_options_data(self, symbol: str, data: pd.DataFrame):
-        """Store options data in SQLite database"""
-        with sqlite3.connect(self.db_path) as conn:
-            data['symbol'] = symbol
-            data['date'] = datetime.now().date()
-            
-            # Store in database
-            data.to_sql('options_data', conn, if_exists='append', index=False)
-            
-    def get_historical_volatility(
-        self, 
-        symbol: str, 
-        window: int = 30
-    ) -> pd.Series:
-        """
-        Calculate historical volatility for a symbol
-        
-        Args:
-            symbol: Stock symbol
-            window: Rolling window for volatility calculation
-            
-        Returns:
-            Series of historical volatility values
-        """
-        # Get historical data
-        data = self.fetch_historical_data(MarketDataConfig(
-            symbols=[symbol],
-            start_date=datetime.now() - timedelta(days=window*2),
-            end_date=datetime.now()
-        ))[symbol]
-        
-        # Calculate daily returns
-        returns = data['Close'].pct_change()
-        
-        # Calculate rolling volatility
-        volatility = returns.rolling(
-            window=window
-        ).std() * np.sqrt(252)  # Annualize
-        
-        return volatility
